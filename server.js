@@ -1,3 +1,4 @@
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -27,20 +28,10 @@ for (const dir of [UPLOAD_DIR, FRAME_DIR, OUTPUT_DIR]) {
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-app.use(
-  "/outputs",
-  express.static(OUTPUT_DIR, {
-    setHeaders(res) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-    }
-  })
-);
+app.use("/outputs", express.static(OUTPUT_DIR));
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     const extension = path.extname(file.originalname || ".mp4");
     cb(null, `${randomUUID()}${extension}`);
@@ -49,14 +40,11 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 1024 * 1024 * 1024
-  },
+  limits: { fileSize: 1024 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith("video/")) {
       return cb(new Error("Video ဖိုင်ကိုသာ Upload လုပ်နိုင်ပါတယ်။"));
     }
-
     cb(null, true);
   }
 });
@@ -80,7 +68,6 @@ function safeFilePath(filename, directory = UPLOAD_DIR) {
 
 function safeNumber(value, fallback = 0) {
   const number = Number(value);
-
   return Number.isFinite(number) ? number : fallback;
 }
 
@@ -99,9 +86,7 @@ async function getVideoInfo(filePath) {
       "-of", "json",
       filePath
     ],
-    {
-      maxBuffer: 10 * 1024 * 1024
-    }
+    { maxBuffer: 10 * 1024 * 1024 }
   );
 
   const data = JSON.parse(stdout);
@@ -114,36 +99,30 @@ async function getVideoInfo(filePath) {
   return {
     width: Number(stream.width || 0),
     height: Number(stream.height || 0),
-    duration: Number(
-      stream.duration || data.format?.duration || 0
-    ),
+    duration: Number(stream.duration || data.format?.duration || 0),
     frameRate: stream.avg_frame_rate || "unknown"
   };
 }
 
 async function detectScenes(filePath, duration) {
-  const threshold = 0.35;
-
-  const filter = `select='gt(scene,${threshold})',showinfo`;
+  const filter = "select='gt(scene,0.35)',showinfo";
 
   const { stderr } = await execFileAsync(
     ffmpegPath,
     [
       "-hide_banner",
+      "-threads", "1",
       "-i", filePath,
       "-vf", filter,
       "-an",
       "-f", "null",
       "-"
     ],
-    {
-      maxBuffer: 50 * 1024 * 1024
-    }
+    { maxBuffer: 50 * 1024 * 1024 }
   );
 
   const timestamps = [];
   const regex = /pts_time:([0-9]+(?:\.[0-9]+)?)/g;
-
   let match;
 
   while ((match = regex.exec(stderr)) !== null) {
@@ -165,12 +144,11 @@ async function createSceneFrames(filePath, sceneTimes, filename) {
   const frames = [];
   const safeBase = path.parse(filename).name;
 
-  // Frame အများကြီးထုတ်ပြီး Server ပြည့်မသွားစေရန်
-  const selectedTimes = sceneTimes.slice(0, 300);
+  // RAM နည်းသော Server အတွက် Frame 100 ခုသာထုတ်မည်
+  const selectedTimes = sceneTimes.slice(0, 100);
 
   for (let i = 0; i < selectedTimes.length; i++) {
     const timestamp = selectedTimes[i];
-
     const frameName = `${safeBase}-scene-${i + 1}.jpg`;
     const framePath = path.join(FRAME_DIR, frameName);
 
@@ -179,14 +157,16 @@ async function createSceneFrames(filePath, sceneTimes, filename) {
       [
         "-hide_banner",
         "-loglevel", "error",
+        "-threads", "1",
         "-ss", String(timestamp),
         "-i", filePath,
         "-frames:v", "1",
-        "-vf", "scale=640:-1",
-        "-q:v", "3",
+        "-vf", "scale=480:-1",
+        "-q:v", "5",
         "-y",
         framePath
-      ]
+      ],
+      { maxBuffer: 5 * 1024 * 1024 }
     );
 
     frames.push({
@@ -199,35 +179,36 @@ async function createSceneFrames(filePath, sceneTimes, filename) {
   return frames;
 }
 
+function makeScenes(sceneTimes, duration) {
+  const boundaries = [0, ...sceneTimes, duration];
+  const scenes = [];
+
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    scenes.push({
+      scene: i + 1,
+      start: boundaries[i],
+      end: boundaries[i + 1],
+      duration: boundaries[i + 1] - boundaries[i]
+    });
+  }
+
+  return scenes;
+}
+
 function buildEditingPlan(scenes, videoDuration) {
   const plannedScenes = scenes.map((scene, index) => {
     const duration = scene.end - scene.start;
 
-    let speed = 1;
-    let reason = "ပုံမှန်အမြန်နှုန်း";
-
-    // အလွန်တိုသော Scene များကို အနည်းငယ်မြန်စေ
-    if (duration < 2.5) {
-      speed = 1.15;
-      reason = "တိုတောင်းသော Scene ကို အနည်းငယ်မြန်စေ";
-    }
-
-    // အလွန်ရှည်သော Scene များကို အနည်းငယ်ချုံ့
-    if (duration > 18) {
-      speed = 1.2;
-      reason = "ရှည်လျားသော Scene ကို ပိုမိုသွက်လက်စေ";
-    }
-
-    // လက်ရှိ Scene detector သည် ဇာတ်လမ်းအဓိပ္ပာယ်ကို မသိနိုင်သေး။
-    // အရေးကြီးသောဇာတ်ကွက်ကို AI က အတည်ပြုပြီးမှ ဖြတ်တောက်သင့်သည်။
+    // လက်ရှိမှာ အရေးကြီးဇာတ်ကွက် မဖြတ်ပါ။
+    // AI ဇာတ်လမ်းသုံးသပ်မှု မချိတ်ရသေးပါ။
     return {
       scene: index + 1,
       start: Number(scene.start.toFixed(3)),
       end: Number(scene.end.toFixed(3)),
       originalDuration: Number(duration.toFixed(3)),
-      speed,
+      speed: 1,
       keep: true,
-      reason
+      reason: "မူရင်းဇာတ်ကွက်ကို ထိန်းသိမ်းထားသည်"
     };
   });
 
@@ -235,89 +216,108 @@ function buildEditingPlan(scenes, videoDuration) {
     videoDuration,
     sceneCount: plannedScenes.length,
     scenes: plannedScenes,
-    note:
-      "Scene detection သာဖြစ်ပြီး ဇာတ်လမ်းအရေးကြီးမှုကို AI ဖြင့် မသုံးသပ်ရသေးပါ။"
+    note: "AI ဇာတ်လမ်းသုံးသပ်မှုနှင့် မြန်မာအသံ မချိတ်ရသေးပါ။"
   };
 }
 
+// Scene တစ်ခုချင်းစီကို Render လုပ်ပြီး နောက်မှ ပေါင်းမည်။
 async function renderVideo(filePath, plan, outputPath) {
-  if (!plan.scenes.length) {
+  if (!plan || !Array.isArray(plan.scenes)) {
+    throw new Error("Editing plan မရှိပါ။");
+  }
+
+  const scenes = plan.scenes.filter(scene =>
+    scene.keep !== false &&
+    Number(scene.end) > Number(scene.start)
+  );
+
+  if (!scenes.length) {
     throw new Error("Render လုပ်ရန် Scene မရှိပါ။");
   }
 
-  const filters = [];
-  const inputs = [];
-
-  let index = 0;
-
-  for (const scene of plan.scenes) {
-    if (!scene.keep) continue;
-
-    const start = safeNumber(scene.start);
-    const end = safeNumber(scene.end);
-    const speed = clamp(safeNumber(scene.speed, 1), 0.5, 2);
-
-    if (end <= start) continue;
-
-    const duration = end - start;
-
-    filters.push(
-      `[0:v]trim=start=${start}:end=${end},` +
-      `setpts=(PTS-STARTPTS)/${speed},` +
-      `scale=1280:720:force_original_aspect_ratio=decrease,` +
-      `pad=1280:720:(ow-iw)/2:(oh-ih)/2,` +
-      `setsar=1[v${index}]`
-    );
-
-    filters.push(
-      `[0:a]atrim=start=${start}:end=${end},` +
-      `asetpts=PTS-STARTPTS,` +
-      `atempo=${speed}[a${index}]`
-    );
-
-    inputs.push({
-      video: `v${index}`,
-      audio: `a${index}`
-    });
-
-    index++;
-  }
-
-  if (!inputs.length) {
-    throw new Error("အသုံးပြုနိုင်သော Scene မရှိပါ။");
-  }
-
-  const concatInputs = inputs
-    .map(item => `[${item.video}][${item.audio}]`)
-    .join("");
-
-  filters.push(
-    `${concatInputs}concat=n=${inputs.length}:v=1:a=1[outv][outa]`
+  const tempDir = path.join(
+    OUTPUT_DIR,
+    `temp-${randomUUID()}`
   );
 
-  await execFileAsync(
-    ffmpegPath,
-    [
-      "-hide_banner",
-      "-i", filePath,
-      "-filter_complex", filters.join(";"),
-      "-map", "[outv]",
-      "-map", "[outa]",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-c:a", "aac",
-      "-b:a", "192k",
-      "-movflags", "+faststart",
-      "-y",
-      outputPath
-    ],
-    {
-      maxBuffer: 100 * 1024 * 1024
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  const parts = [];
+
+  try {
+    for (let i = 0; i < scenes.length; i++) {
+      const scene = scenes[i];
+
+      const start = safeNumber(scene.start);
+      const end = safeNumber(scene.end);
+      const speed = clamp(safeNumber(scene.speed, 1), 0.5, 2);
+
+      if (end <= start) continue;
+
+      const partPath = path.join(tempDir, `part-${i}.mp4`);
+
+      const args = [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-threads", "1",
+        "-filter_threads", "1",
+        "-ss", String(start),
+        "-i", filePath,
+        "-t", String(end - start),
+        "-vf",
+        `setpts=(PTS-STARTPTS)/${speed},scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-threads", "1",
+        "-crf", "28",
+        "-an",
+        "-y",
+        partPath
+      ];
+
+      await execFileAsync(ffmpegPath, args, {
+        maxBuffer: 10 * 1024 * 1024
+      });
+
+      parts.push(partPath);
     }
-  );
 
-  return outputPath;
+    if (!parts.length) {
+      throw new Error("Render လုပ်ရန် Video အပိုင်းမရှိပါ။");
+    }
+
+    const listPath = path.join(tempDir, "list.txt");
+
+    fs.writeFileSync(
+      listPath,
+      parts.map(file => `file '${file}'`).join("\n")
+    );
+
+    await execFileAsync(
+      ffmpegPath,
+      [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-threads", "1",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", listPath,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-y",
+        outputPath
+      ],
+      { maxBuffer: 10 * 1024 * 1024 }
+    );
+
+    return outputPath;
+
+  } finally {
+    fs.rmSync(tempDir, {
+      recursive: true,
+      force: true
+    });
+  }
 }
 
 app.get("/", (req, res) => {
@@ -358,13 +358,15 @@ app.post("/api/analyze", async (req, res) => {
   try {
     const { filename } = req.body;
     const filePath = safeFilePath(filename);
-
     const videoInfo = await getVideoInfo(filePath);
 
-    if (videoInfo.duration > 350 * 60) {
+    if (
+      !videoInfo.duration ||
+      videoInfo.duration > 350 * 60
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Video ကြာချိန် 350 မိနစ်ထက် ကျော်နေပါတယ်။"
+        message: "Video ကြာချိန် မမှန်ပါ သို့မဟုတ် 350 မိနစ်ကျော်နေပါတယ်။"
       });
     }
 
@@ -379,22 +381,10 @@ app.post("/api/analyze", async (req, res) => {
       filename
     );
 
-    const boundaries = [
-      0,
-      ...sceneTimes,
+    const scenes = makeScenes(
+      sceneTimes,
       videoInfo.duration
-    ];
-
-    const scenes = [];
-
-    for (let i = 0; i < boundaries.length - 1; i++) {
-      scenes.push({
-        scene: i + 1,
-        start: boundaries[i],
-        end: boundaries[i + 1],
-        duration: boundaries[i + 1] - boundaries[i]
-      });
-    }
+    );
 
     res.json({
       success: true,
@@ -404,6 +394,7 @@ app.post("/api/analyze", async (req, res) => {
       scenes,
       frames
     });
+
   } catch (error) {
     console.error("Scene analysis error:", error);
 
@@ -418,7 +409,6 @@ app.post("/api/editing-plan", async (req, res) => {
   try {
     const { filename } = req.body;
     const filePath = safeFilePath(filename);
-
     const videoInfo = await getVideoInfo(filePath);
 
     if (videoInfo.duration > 350 * 60) {
@@ -433,22 +423,10 @@ app.post("/api/editing-plan", async (req, res) => {
       videoInfo.duration
     );
 
-    const boundaries = [
-      0,
-      ...sceneTimes,
+    const scenes = makeScenes(
+      sceneTimes,
       videoInfo.duration
-    ];
-
-    const scenes = [];
-
-    for (let i = 0; i < boundaries.length - 1; i++) {
-      scenes.push({
-        scene: i + 1,
-        start: boundaries[i],
-        end: boundaries[i + 1],
-        duration: boundaries[i + 1] - boundaries[i]
-      });
-    }
+    );
 
     const plan = buildEditingPlan(
       scenes,
@@ -460,6 +438,7 @@ app.post("/api/editing-plan", async (req, res) => {
       message: "Editing plan created",
       plan
     });
+
   } catch (error) {
     console.error("Editing plan error:", error);
 
@@ -473,7 +452,6 @@ app.post("/api/editing-plan", async (req, res) => {
 app.post("/api/render", async (req, res) => {
   try {
     const { filename, plan } = req.body;
-
     const filePath = safeFilePath(filename);
 
     if (!plan || !Array.isArray(plan.scenes)) {
@@ -496,6 +474,7 @@ app.post("/api/render", async (req, res) => {
         url: `${req.protocol}://${req.get("host")}/outputs/${outputName}`
       }
     });
+
   } catch (error) {
     console.error("Render error:", error);
 
